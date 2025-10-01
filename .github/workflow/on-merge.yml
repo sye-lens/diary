@@ -1,9 +1,9 @@
-name: On PR Merged - Update weekly & README & Notify
+name: On PR Merged - Update weekly & README
 
 on:
   pull_request:
     types: [closed]
-    branches: [main]  # mainにマージされたときだけ動かす
+    branches: [main]  # mainにマージされた時だけ起動
 
 jobs:
   on-merged:
@@ -11,14 +11,14 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write       # weekly.md/READMEをコミットするため
-      pull-requests: read   # 変更ファイルを読むため
+      contents: write
+      pull-requests: read
 
     steps:
       - name: Checkout
-      - uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
-      - name: Extract changed entry file path(s)
+      - name: Determine changed entry file path
         id: files
         uses: actions/github-script@v7
         with:
@@ -29,33 +29,40 @@ jobs:
               repo: context.repo.repo,
               pull_number: pr,
             });
-            // entries/YYYY/YYYY-MM-DD.md だけ拾う
             const entryFiles = files
               .map(f => f.filename)
               .filter(p => /^entries\/\d{4}\/\d{4}-\d{2}-\d{2}\.md$/.test(p));
-            if (entryFiles.length === 0) {
-              core.setFailed('No daily entry file found in PR (expected entries/YYYY/YYYY-MM-DD.md)');
-              return;
+            if (!entryFiles.length) {
+              core.setFailed('No daily entry file found (expected entries/YYYY/YYYY-MM-DD.md)');
             }
-            // 複数ある場合は名前で降順（=日付が新しい）先頭を採用
-            entryFiles.sort().reverse();
+            entryFiles.sort().reverse(); // 一番新しい日付を採用
             core.setOutput('entry', entryFiles[0]);
 
-      - name: Update weekly.md & README.md
+      - name: Update weekly.md and README.md
         id: update
+        shell: bash
         run: |
+          set -euxo pipefail
           ENTRY_PATH="${{ steps.files.outputs.entry }}"
-          ENTRY_FILE="$(basename "$ENTRY_PATH")"           # 2025-10-02.md
-          ENTRY_DATE="${ENTRY_FILE%.md}"                   # 2025-10-02
-          YEAR_DIR="$(dirname "$ENTRY_PATH" | cut -d'/' -f2)"  # 2025
+          ENTRY_FILE="$(basename "$ENTRY_PATH")"      # e.g. 2025-10-02.md
+          ENTRY_DATE="${ENTRY_FILE%.md}"              # e.g. 2025-10-02
 
-          # weekly.md 末尾に追記（リンク形式）
-          echo "- [${ENTRY_DATE} の振り返り](${ENTRY_PATH})" >> weekly.md
+          # weekly.mdがなければ初期化
+          if [ ! -f weekly.md ]; then
+            printf "# 今週の振り返り\n\n" > weekly.md
+          fi
 
-          # README のプレースホルダを最新リンクに置換
-          SAFE_LINK="- [${ENTRY_DATE} の振り返り](${ENTRY_PATH})"
-          # macOS/GNU両対応のため perl で置換
-          perl -0777 -pe "s|<!-- LAST_ENTRY_LINK -->.*|<!-- LAST_ENTRY_LINK --> ${SAFE_LINK}|s" -i README.md
+          # weekly.md 末尾に追記（重複防止）
+          LINE="- [${ENTRY_DATE} の振り返り](${ENTRY_PATH})"
+          (grep -qxF "$LINE" weekly.md) || echo "$LINE" >> weekly.md
+
+          # READMEのプレースホルダを最新リンクで置換
+          # READMEに必ず以下の文字列を入れておくこと：
+          #   <!-- LAST_ENTRY_LINK -->
+          if [ ! -f README.md ]; then
+            printf "# Daily Reflection\n\n## 最新の振り返り\n<!-- LAST_ENTRY_LINK -->\n" > README.md
+          fi
+          perl -0777 -pe "s|<!-- LAST_ENTRY_LINK -->.*|<!-- LAST_ENTRY_LINK --> - [${ENTRY_DATE} の振り返り](${ENTRY_PATH})|s" -i README.md
 
           echo "entry_date=${ENTRY_DATE}" >> $GITHUB_OUTPUT
           echo "entry_path=${ENTRY_PATH}" >> $GITHUB_OUTPUT
@@ -63,47 +70,7 @@ jobs:
       - name: Commit changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: update weekly and README for ${{ steps.update.outputs.entry_date }}"
+          commit_message: "chore: update weekly & README for ${{ steps.update.outputs.entry_date }}"
           file_pattern: |
             weekly.md
             README.md
-
-      # ===== ここから通知（任意） =====
-      # --- Slack (Incoming Webhook) ---
-      - name: Notify Slack (optional)
-        if: env.SLACK_WEBHOOK_URL != ''
-        run: |
-          payload=$(jq -n --arg text ":tada: PR #${{ github.event.pull_request.number }} merged! Latest entry: ${{ steps.update.outputs.entry_path }}" '{text: $text}')
-          curl -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-
-      # --- Discord (Webhook) ---
-      - name: Notify Discord (optional)
-        if: env.DISCORD_WEBHOOK_URL != ''
-        run: |
-          payload=$(jq -n --arg content ":tada: PR #${{ github.event.pull_request.number }} merged! Latest entry: ${{ steps.update.outputs.entry_path }}" '{content: $content}')
-          curl -X POST -H 'Content-Type: application/json' -d "$payload" "$DISCORD_WEBHOOK_URL"
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-
-      # --- Mastodon (Access Token + Instance URL) ---
-      - name: Toot Mastodon (optional)
-        if: env.MASTODON_TOKEN != '' && env.MASTODON_INSTANCE != ''
-        run: |
-          curl -sS -X POST "https://${MASTODON_INSTANCE}/api/v1/statuses" \
-            -H "Authorization: Bearer ${MASTODON_TOKEN}" \
-            --data-urlencode "status=🎉 PR #${{ github.event.pull_request.number }} merged! Latest entry: ${{ steps.update.outputs.entry_path }}"
-        env:
-          MASTODON_TOKEN: ${{ secrets.MASTODON_TOKEN }}
-          MASTODON_INSTANCE: ${{ secrets.MASTODON_INSTANCE }} # 例: mstdn.jp
-
-      # --- LINE Notify (Token) ---
-      - name: Notify LINE (optional)
-        if: env.LINE_NOTIFY_TOKEN != ''
-        run: |
-          curl -sS -X POST https://notify-api.line.me/api/notify \
-            -H "Authorization: Bearer ${LINE_NOTIFY_TOKEN}" \
-            -F "message=🎉 PR #${{ github.event.pull_request.number }} merged! Latest entry: ${{ steps.update.outputs.entry_path }}"
-        env:
-          LINE_NOTIFY_TOKEN: ${{ secrets.LINE_NOTIFY_TOKEN }}
